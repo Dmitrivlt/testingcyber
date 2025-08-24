@@ -40,9 +40,9 @@ class Config:
     pos_pct: float = DEFAULT_POS_PCT  # доля депозита, используемая как МАРЖА (0..1)
     use_testnet: bool = USE_TESTNET
     # EMA
-    len50: int = 4
+    len50: int = 50
     len100: int = 100
-    len200: int = 6
+    len200: int = 200
     # Strategy mode
     logic_mode: str = "inverted"   # "inverted": LONG=crossunder, SHORT=crossover; "standard" наоборот
     # Risk
