@@ -1,47 +1,127 @@
-import os, time, math
+import os, time, hmac, hashlib, math
 from dataclasses import dataclass
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+from urllib.parse import urlencode
+
+import requests
 import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 
-# pip install binance-connector
-from binance.um_futures import UMFutures
-
-# ================== Config ==================
+# ========= ENV =========
 load_dotenv()
-API_KEY     = os.getenv("BINANCE_API_KEY")
-API_SECRET  = os.getenv("BINANCE_API_SECRET")
-USE_TESTNET = os.getenv("USE_TESTNET", "true").lower() == "true"
+API_KEY     = os.getenv("BINANCE_API_KEY") or ""
+API_SECRET  = os.getenv("BINANCE_API_SECRET") or ""
+USE_TESTNET = (os.getenv("USE_TESTNET", "true").lower() == "true")
 SYMBOL      = os.getenv("SYMBOL", "BTCUSDT")
 INTERVAL    = os.getenv("INTERVAL", "1m")
 LEVERAGE    = int(os.getenv("LEVERAGE", "2"))
 POS_PCT     = float(os.getenv("POSITION_SIZE_PCT", "1.0"))
 
-# Testnet base_url (mainnet = None)
-BASE_URL = "https://testnet.binancefuture.com" if USE_TESTNET else None
+BASE_URL = "https://testnet.binancefuture.com" if USE_TESTNET else "https://fapi.binance.com"
 
-# ================== TA helpers ==================
+# ========= TA =========
 def ema(series: pd.Series, length: int) -> pd.Series:
     return series.ewm(span=length, adjust=False).mean()
 
 def crossover(a: pd.Series, b: pd.Series) -> pd.Series:
-    # текущая свеча: a>b, предыдущая: a<=b
     return (a > b) & (a.shift(1) <= b.shift(1))
 
 def crossunder(a: pd.Series, b: pd.Series) -> pd.Series:
-    # текущая свеча: a<b, предыдущая: a>=b
     return (a < b) & (a.shift(1) >= b.shift(1))
 
-# ================== Filters helpers ==================
-def parse_filters(exchange_info: Dict[str, Any], symbol: str) -> Dict[str, Any]:
-    sym = next(s for s in exchange_info["symbols"] if s["symbol"] == symbol)
-    filters = {f["filterType"]: f for f in sym.get("filters", [])}
-    lot = filters.get("MARKET_LOT_SIZE") or filters.get("LOT_SIZE", {})
-    tick = filters.get("PRICE_FILTER", {})
-    # На USD-M фьючах minNotional может отсутствовать; тогда просто не проверяем
-    notional = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL", {})
-    return {
+# ========= Binance Futures HTTP (без SDK) =========
+class BinanceFuturesHTTP:
+    def __init__(self, api_key: str, api_secret: str, base_url: str):
+        self.session = requests.Session()
+        self.api_key = api_key
+        self.api_secret = api_secret.encode()
+        self.base_url = base_url
+        self.recv_window = 5000
+        self.time_offset_ms = 0
+        self.sync_time()
+
+    # ----- подпись -----
+    def _ts(self) -> int:
+        return int(time.time() * 1000) + self.time_offset_ms
+
+    def _sign(self, params: Dict[str, Any]) -> str:
+        q = urlencode(params, doseq=True)
+        sig = hmac.new(self.api_secret, q.encode(), hashlib.sha256).hexdigest()
+        return q + "&signature=" + sig
+
+    # ----- base requests -----
+    def get(self, path: str, params: Optional[Dict[str, Any]] = None, signed: bool = False):
+        params = params or {}
+        headers = {}
+        url = self.base_url + path
+        if signed:
+            params["timestamp"] = self._ts()
+            params["recvWindow"] = self.recv_window
+            headers["X-MBX-APIKEY"] = self.api_key
+            return self.session.get(url + "?" + self._sign(params), headers=headers, timeout=15).json()
+        return self.session.get(url, params=params, timeout=15).json()
+
+    def post(self, path: str, params: Dict[str, Any], signed: bool = True):
+        headers = {"X-MBX-APIKEY": self.api_key}
+        url = self.base_url + path
+        params["timestamp"] = self._ts()
+        params["recvWindow"] = self.recv_window
+        return self.session.post(url, headers=headers, data=self._sign(params), timeout=15).json()
+
+    # ----- time sync -----
+    def sync_time(self):
+        try:
+            r = self.session.get(self.base_url + "/fapi/v1/time", timeout=10).json()
+            server = int(r["serverTime"])
+            self.time_offset_ms = server - int(time.time() * 1000)
+            print("Time synced. offset(ms)=", self.time_offset_ms)
+        except Exception as e:
+            print("Time sync failed:", e)
+            self.time_offset_ms = 0
+
+    # ----- endpoints -----
+    def exchange_info(self, symbol: Optional[str] = None):
+        p = {"symbol": symbol} if symbol else {}
+        return self.get("/fapi/v1/exchangeInfo", p)
+
+    def klines(self, symbol: str, interval: str, limit: int = 210):
+        return self.get("/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
+
+    def mark_price(self, symbol: str):
+        return self.get("/fapi/v1/premiumIndex", {"symbol": symbol})
+
+    def position_risk(self, symbol: str):
+        return self.get("/fapi/v2/positionRisk", {"symbol": symbol}, signed=True)
+
+    def balance(self):
+        return self.get("/fapi/v2/balance", signed=True)
+
+    def change_position_mode(self, dual_side: bool):
+        # false = One-way
+        return self.post("/fapi/v1/positionSide/dual", {"dualSidePosition": "true" if dual_side else "false"})
+
+    def change_margin_type(self, symbol: str, margin_type: str):
+        # "ISOLATED" / "CROSSED"
+        return self.post("/fapi/v1/marginType", {"symbol": symbol, "marginType": margin_type})
+
+    def change_leverage(self, symbol: str, leverage: int):
+        return self.post("/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
+
+    def new_order(self, symbol: str, side: str, type_: str, quantity: str, reduce_only: Optional[bool] = None):
+        p = {"symbol": symbol, "side": side, "type": type_, "quantity": quantity}
+        if reduce_only is not None:
+            p["reduceOnly"] = "true" if reduce_only else "false"
+        return self.post("/fapi/v1/order", p)
+
+# ========= helpers =========
+def parse_filters(ex_info: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    sym = next(s for s in ex_info["symbols"] if s["symbol"] == symbol)
+    f = {ff["filterType"]: ff for ff in sym.get("filters", [])}
+    lot = f.get("MARKET_LOT_SIZE") or f.get("LOT_SIZE", {})
+    tick = f.get("PRICE_FILTER", {})
+    notional = f.get("NOTIONAL") or f.get("MIN_NOTIONAL", {})
+    res = {
         "minQty": float(lot.get("minQty", "0")),
         "maxQty": float(lot.get("maxQty", "1e50")),
         "stepSize": float(lot.get("stepSize", "1")),
@@ -49,13 +129,14 @@ def parse_filters(exchange_info: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         "minNotional": float(notional.get("minNotional", "0")) if "minNotional" in notional else None,
         "maxNotional": float(notional.get("maxNotional", "1e50")) if "maxNotional" in notional else None,
     }
+    return res
 
 def round_step(x: float, step: float) -> float:
     if step == 0:
         return x
     return math.floor(x / step) * step
 
-# ================== Strategy Runner ==================
+# ========= Strategy Runner =========
 @dataclass
 class EMACrossoverInvertedLive:
     len50: int = 50
@@ -63,49 +144,36 @@ class EMACrossoverInvertedLive:
     len200: int = 200
 
     def __post_init__(self):
-        self.client = UMFutures(key=API_KEY, secret=API_SECRET, base_url=BASE_URL)
+        self.client = BinanceFuturesHTTP(API_KEY, API_SECRET, BASE_URL)
 
-        # Режим позиции: one-way (не хедж). Если уже выставлен — будет warning, это нормально.
-        try:
-            self.client.change_position_mode(dualSidePosition="false")
-        except Exception as e:
-            print("Position mode note:", e)
+        # режим one-way и изолированная маржа (не обязательно; может вернуть ошибку, если позиция открыта)
+        try: print("Position mode:", self.client.change_position_mode(False))
+        except Exception as e: print("Position mode note:", e)
 
-        # По желанию можно изолированную маржу; если позиция открыта — может не дать сменить.
-        try:
-            self.client.change_margin_type(symbol=SYMBOL, marginType="ISOLATED")
-        except Exception as e:
-            print("Margin type note:", e)
+        try: print("Margin type:", self.client.change_margin_type(SYMBOL, "ISOLATED"))
+        except Exception as e: print("Margin type note:", e)
 
-        # Плечо
-        try:
-            self.client.change_leverage(symbol=SYMBOL, leverage=LEVERAGE)
-        except Exception as e:
-            print("Leverage note:", e)
+        try: print("Leverage:", self.client.change_leverage(SYMBOL, LEVERAGE))
+        except Exception as e: print("Leverage note:", e)
 
-        # Биржевые фильтры
         try:
-            self.filters = parse_filters(self.client.exchange_info(), SYMBOL)
+            ex = self.client.exchange_info(SYMBOL)
+            self.filters = parse_filters(ex, SYMBOL)
             print("Filters:", self.filters)
         except Exception as e:
             print("Exchange info note:", e)
             self.filters = {"minQty": 0.0, "maxQty": 1e50, "stepSize": 1.0, "tickSize": 0.0,
                             "minNotional": None, "maxNotional": None}
 
-        # Быстрая проверка цены
         try:
-            mp = self.client.mark_price(symbol=SYMBOL)
+            mp = self.client.mark_price(SYMBOL)
             print("Mark price:", mp.get("markPrice"))
         except Exception as e:
             print("Mark price note:", e)
 
-    # ---------- Data ----------
-    def get_price(self) -> float:
-        mp = self.client.mark_price(symbol=SYMBOL)
-        return float(mp["markPrice"])
-
+    # ---- data ----
     def get_klines(self, limit=210) -> pd.DataFrame:
-        k = self.client.klines(symbol=SYMBOL, interval=INTERVAL, limit=limit)
+        k = self.client.klines(SYMBOL, INTERVAL, limit=limit)
         df = pd.DataFrame(k, columns=[
             "open_time","open","high","low","close","volume",
             "close_time","qav","trades","tbbav","tbqav","ignore"
@@ -113,28 +181,20 @@ class EMACrossoverInvertedLive:
         df["close"] = df["close"].astype(float)
         return df
 
-    # ---------- Account/position ----------
     def get_position_qty(self) -> float:
-        # Возьмём position_information (qty>0=long, <0=short)
-        info = self.client.position_information(symbol=SYMBOL)
-        if isinstance(info, list) and info:
-            return float(info[0]["positionAmt"])
+        r = self.client.position_risk(SYMBOL)
+        if isinstance(r, list) and r:
+            return float(r[0]["positionAmt"])
         return 0.0
 
     def account_equity(self) -> float:
-        # Баланс USDT на фьючерсах
         bal = self.client.balance()
         usdt = next((b for b in bal if b["asset"] == "USDT"), None)
-        if not usdt:
-            return 0.0
-        return float(usdt["balance"])
+        return float(usdt["balance"]) if usdt else 0.0
 
-    # ---------- Sizing/checks ----------
     def qty_from_equity(self, price: float, equity_usdt: float) -> float:
-        # Номинал позиции = POS_PCT * equity; qty = notional / price
         notional = POS_PCT * equity_usdt
         raw_qty = notional / price
-        # округляем под stepSize и проверяем минимум
         qty = max(self.filters["minQty"], round_step(raw_qty, self.filters["stepSize"]))
         return qty
 
@@ -152,41 +212,50 @@ class EMACrossoverInvertedLive:
             return False
         return True
 
-    # ---------- Trading ----------
     def market_close_all(self, side_to_close: str, qty: float):
-        if qty <= 0:
-            return
+        if qty <= 0: return
         try:
-            self.client.new_order(
-                symbol=SYMBOL, side=side_to_close, type="MARKET",
-                quantity=str(qty), reduceOnly="true"
-            )
+            r = self.client.new_order(SYMBOL, side_to_close, "MARKET", str(qty), reduce_only=True)
+            print("Close:", r)
         except Exception as e:
             print("reduceOnly close warning:", e)
 
     def market_open(self, side: str, qty: float):
-        self.client.new_order(symbol=SYMBOL, side=side, type="MARKET", quantity=str(qty))
+        r = self.client.new_order(SYMBOL, side, "MARKET", str(qty))
+        print("Open:", r)
 
-    # ---------- Logic on bar close ----------
     def run_once_on_close(self):
         df = self.get_klines()
         close = df["close"].astype(float)
 
         ema50  = ema(close, self.len50)
-        ema100 = ema(close, self.len100)  # для визуального/отладочного фона (на входы не влияет)
+        ema100 = ema(close, self.len100)  # визуальный фон
         ema200 = ema(close, self.len200)
 
-        long_sig  = crossunder(ema50, ema200)  # Лонг на crossunder(50,200)
-        short_sig = crossover(ema50, ema200)   # Шорт на crossover(50,200)
+        long_sig  = crossunder(ema50, ema200)  # Лонг при crossunder(50,200)
+        short_sig = crossover(ema50, ema200)   # Шорт при crossover(50,200)
 
         go_long  = bool(long_sig.iloc[-1])
         go_short = bool(short_sig.iloc[-1])
+
+        # --- Снимок позиции всегда (для наглядности) ---
+        try:
+            pr = self.client.position_risk(SYMBOL)
+            if isinstance(pr, list) and pr:
+                p = pr[0]
+                pos_qty = float(p.get("positionAmt", 0))
+                entry   = float(p.get("entryPrice", 0))
+                upnl    = float(p.get("unRealizedProfit", 0))
+                side_txt = "LONG" if pos_qty > 0 else "SHORT" if pos_qty < 0 else "FLAT"
+                print(f"Position snapshot: side={side_txt}, qty={pos_qty}, entry={entry}, uPnL={upnl}")
+        except Exception as e:
+            print("Position snapshot note:", e)
 
         if not (go_long or go_short):
             print("Нет сигнала на закрытии свечи.")
             return
 
-        price  = self.get_price()
+        price  = float(self.client.mark_price(SYMBOL)["markPrice"])
         equity = self.account_equity()
         qty    = self.qty_from_equity(price, equity)
 
@@ -196,33 +265,27 @@ class EMACrossoverInvertedLive:
         pos_qty = self.get_position_qty()
         print(f"Signal: {'LONG' if go_long else 'SHORT'} | equity={equity:.4f} | price={price:.6f} | qty={qty} | pos_qty={pos_qty}")
 
-        # Переворот: сначала закрыть встречную сторону, затем открыть нужную
         if go_long:
-            if pos_qty < 0:
-                self.market_close_all("BUY", abs(pos_qty))
+            if pos_qty < 0: self.market_close_all("BUY", abs(pos_qty))
             self.market_open("BUY", qty)
 
         if go_short:
-            if pos_qty > 0:
-                self.market_close_all("SELL", abs(pos_qty))
+            if pos_qty > 0: self.market_close_all("SELL", abs(pos_qty))
             self.market_open("SELL", qty)
 
-
+# ========= main loop =========
 if __name__ == "__main__":
-    # Перед стартом: проверь .env (ключи, USE_TESTNET, SYMBOL, INTERVAL, плечо, процент позиции)
     bot = EMACrossoverInvertedLive(len50=50, len100=100, len200=200)
     last_close_time = None
-
-    # Простейший цикл «на закрытии свечи»
     while True:
         try:
             kl = bot.get_klines(limit=2)
-            close_time = int(kl["close_time"].iloc[-1])  # миллисекунды конца текущей свечи
+            close_time = int(kl["close_time"].iloc[-1])
             if close_time != last_close_time:
                 bot.run_once_on_close()
                 last_close_time = close_time
         except KeyboardInterrupt:
-            print("Stopped by user.")
+            print("Stopped by user")
             break
         except Exception as e:
             print("Loop error:", e)
