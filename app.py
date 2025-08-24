@@ -1,4 +1,5 @@
-import os, time, json, csv, threading, traceback
+# app.py
+import os, time, json, csv, threading
 from dataclasses import dataclass, asdict
 from datetime import datetime
 from typing import Any, Dict, Optional, List
@@ -26,8 +27,8 @@ USE_TESTNET      = env_bool("USE_TESTNET", False)
 DEFAULT_SYMBOL   = os.getenv("SYMBOL", "CYBERUSDT")
 DEFAULT_INTERVAL = os.getenv("INTERVAL", "1m")
 DEFAULT_LEVERAGE = int(os.getenv("LEVERAGE", "2"))
-# По умолчанию используем 90% депозита как МАРЖУ
-DEFAULT_POS_PCT  = float(os.getenv("POSITION_SIZE_PCT", "0.90"))
+# ВАЖНО: теперь pos_pct — это доля депозита, которую используем как МАРЖУ
+DEFAULT_POS_PCT  = float(os.getenv("POSITION_SIZE_PCT", "0.97"))
 TRADES_CSV       = os.getenv("TRADES_CSV", "trades.csv")
 
 # ---------- CONFIG / ENGINE ----------
@@ -36,16 +37,14 @@ class Config:
     symbol: str = DEFAULT_SYMBOL
     interval: str = DEFAULT_INTERVAL
     leverage: int = DEFAULT_LEVERAGE
-    pos_pct: float = DEFAULT_POS_PCT
+    pos_pct: float = DEFAULT_POS_PCT  # доля депозита, используемая как МАРЖА (0..1)
     use_testnet: bool = USE_TESTNET
     # EMA
     len50: int = 4
     len100: int = 100
     len200: int = 6
     # Strategy mode
-    # standard  → LONG=crossunder(ema50, ema200), SHORT=crossover(ema50, ema200)
-    # inverted  → LONG=crossover(ema50, ema200), SHORT=crossunder(ema50, ema200)
-    logic_mode: str = "inverted"
+    logic_mode: str = "inverted"   # "inverted": LONG=crossunder, SHORT=crossover; "standard" наоборот
     # Risk
     sl_pct: float = 0.0            # стоп-лосс % (0=выкл)
     tp_pct: float = 0.0            # тейк-профит %
@@ -120,16 +119,23 @@ class Engine:
         usdt = next((b for b in bal if b["asset"] == "USDT"), None)
         return float(usdt["balance"]) if usdt else 0.0
 
+    # ИСПОЛЬЗУЕМ ПЛЕЧО ТОЛЬКО ИЗ self.cfg (UI). 97% депозита — это маржа. Номинал = маржа * плечо.
     def _qty_from_equity(self, price: float, equity_usdt: float) -> float:
-        """
-        ВСЕГДА используем pos_pct депозита как МАРЖУ (например, 0.90 = 90%),
-        а номинал позиции = маржа * плечо. Так доля маржи не зависит от leverage.
-        """
         lev = max(1.0, float(self.cfg.leverage))
-        margin_target = max(0.0, float(self.cfg.pos_pct)) * equity_usdt  # 90% депозита по умолчанию
-        notional = margin_target * lev
-        raw_qty = notional / price if price > 0 else 0.0
-        return max(self.filters["minQty"], round_step(raw_qty, self.filters["stepSize"]))
+        margin_target = max(0.0, float(self.cfg.pos_pct)) * equity_usdt
+        notional_target = margin_target * lev
+
+        # учтём лимиты биржи по нотионалу (если фильтр есть)
+        mn = self.filters.get("minNotional")
+        mx = self.filters.get("maxNotional")
+        if mn is not None and notional_target < mn:
+            notional_target = mn
+        if mx is not None and notional_target > mx:
+            notional_target = mx
+
+        raw_qty = (notional_target / price) if price > 0 else 0.0
+        qty = round_step(raw_qty, self.filters["stepSize"])
+        return max(self.filters["minQty"], min(qty, self.filters["maxQty"]))
 
     def _ensure_notional_ok(self, price: float, qty: float) -> bool:
         if qty <= 0: return False
@@ -144,19 +150,12 @@ class Engine:
         return True
 
     def _fmt_price(self, p: float) -> float:
-        # стоп-цены должны соответствовать tickSize
         step = self.filters.get("tickSize", 0.0) or 0.0
         if step <= 0: return p
-        # округлим вниз к сетке (для SELL/long SL) и вверх (для BUY/short SL) там, где нужно — упростим: вниз
         digits = max(0, str(step)[::-1].find('.'))
         return round((p // step) * step, digits)
 
     def _open_brackets(self, side: str, entry: float):
-        """
-        Фьючерсы не поддерживают "настоящее OCO". Эмулируем брекеты:
-        ставим два условных MARKET ордера с closePosition=true (SL и TP).
-        Когда один триггерится и позиция закрывается, второй уже нечему исполнять.
-        """
         try:
             if self.cfg.sl_pct > 0:
                 if side == "LONG":
@@ -211,7 +210,7 @@ class Engine:
     # ---------- init exchange ----------
     def _init_exchange(self):
         try:
-            # только плечо (режим/маржу не трогаем — чтобы без ворнингов)
+            # устанавливаем плечо на бирже по UI, но НИКОГДА не читаем его обратно для расчётов
             try:
                 self.client.change_leverage(self.cfg.symbol, self.cfg.leverage)
             except Exception as e:
@@ -231,8 +230,8 @@ class Engine:
                 self.state["snapshot"] = {
                     "symbol": self.cfg.symbol,
                     "interval": self.cfg.interval,
-                    "leverage": self.cfg.leverage,
-                    "pos_pct": self.cfg.pos_pct,
+                    "leverage": self.cfg.leverage,     # из UI
+                    "pos_pct": self.cfg.pos_pct,       # доля депозита как маржа
                     "use_testnet": self.cfg.use_testnet,
                     "time_offset_ms": self.client.time_offset_ms,
                     "mark_price": mark,
@@ -291,6 +290,11 @@ class Engine:
                     "upnl": upnl, "equity": eq + upnl, "upnl_pct": upnl_pct,
                     "side": side, "rr_pct": rr_pct,
                     "server_time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"),
+                    # чтобы UI всегда видел актуальные значения конфигурации
+                    "leverage": self.cfg.leverage,
+                    "pos_pct": self.cfg.pos_pct,
+                    "interval": self.cfg.interval,
+                    "use_testnet": self.cfg.use_testnet,
                 })
                 self.state["blocked"] = self.trading_blocked
 
@@ -306,8 +310,7 @@ class Engine:
                         except Exception as e:
                             self.state["last_error"] = f"Flatten on DLL error: {e}"
 
-            # SL/TP/Trailing как “мягкая” защита (если брекеты выключены)
-            # Если cfg.sl_pct/tp_pct > 0 — брекеты уже стоят, этот блок можно не использовать.
+            # Мягкий трейлинг (если SL/TP не поставлены брекетами)
             if qty != 0 and (self.cfg.sl_pct==0 and self.cfg.tp_pct==0) and not self.trading_blocked and entry > 0:
                 if qty > 0:
                     if self.cfg.trail_pct > 0 and self.trail_max is not None:
@@ -342,12 +345,12 @@ class Engine:
             ema200 = ema(close, self.cfg.len200)
 
             if self.cfg.logic_mode == "inverted":
-                go_long  = bool(crossover(ema50, ema200).iloc[-1])
-                go_short = bool(crossunder(ema50, ema200).iloc[-1])
-            else:
                 go_long  = bool(crossunder(ema50, ema200).iloc[-1])
                 go_short = bool(crossover(ema50, ema200).iloc[-1])
-
+            else:
+                go_long  = bool(crossover(ema50, ema200).iloc[-1])
+                go_short = bool(crossunder(ema50, ema200).iloc[-1])
+                
             with self.lock:
                 self.state["ema"] = {"ema50": float(ema50.iloc[-1]), "ema100": float(ema100.iloc[-1]), "ema200": float(ema200.iloc[-1])}
                 self.state["signals"] = {"long": go_long, "short": go_short}
@@ -359,8 +362,11 @@ class Engine:
             mark = self._get_mark()
             pos  = self._get_pos()
             qtyp = float(pos.get("positionAmt", 0) or 0)
-            eq   = self._account_equity()
-            qty  = self._qty_from_equity(mark, eq)
+            upnl = float(pos.get("unRealizedProfit", 0) or 0)
+
+            eq_wallet = self._account_equity()
+            qty  = self._qty_from_equity(mark, eq_wallet + upnl)  # 97% депозита как маржа, плече — из UI
+
             if not self._ensure_notional_ok(mark, qty):
                 return
 
@@ -373,7 +379,6 @@ class Engine:
                 self.last_signal = "LONG"; self.last_trade = f"{datetime.utcnow().isoformat()}Z LONG qty={qty}"
                 self.trail_max = mark; self.trail_min = None
                 self._log_trade("ENTER_LONG", qty, mark, "SIGNAL")
-                # брекеты
                 if self.cfg.sl_pct>0 or self.cfg.tp_pct>0: self._open_brackets("LONG", mark)
 
             if go_short:
@@ -410,7 +415,6 @@ class Engine:
             self.state["last_error"] = f"WS error: {error}"
 
         def on_close(ws, code, msg):
-            # авто-переподключение
             if not self._stop_event.is_set():
                 time.sleep(2)
                 self._start_ws()
@@ -496,11 +500,11 @@ class Engine:
         if trail   is not None: self.cfg.trail_pct = max(0.0, float(trail))
         if dll     is not None: self.cfg.daily_loss_limit = max(0.0, float(dll))
 
-        # recreate clients/urls/filters
+        # recreate clients/urls/filters под новую сеть/символ/TF
         self.base_rest = "https://testnet.binancefuture.com" if self.cfg.use_testnet else "https://fapi.binance.com"
         self.base_ws   = "wss://stream.binancefuture.com/stream?streams=" if self.cfg.use_testnet else "wss://fstream.binance.com/stream?streams="
         self.client = BinanceFuturesHTTP(API_KEY, API_SECRET, self.base_rest)
-        try: self.client.change_leverage(self.cfg.symbol, self.cfg.leverage)
+        try: self.client.change_leverage(self.cfg.symbol, self.cfg.leverage)  # выставляем плечо по UI
         except Exception: pass
         ex = self.client.exchange_info(self.cfg.symbol)
         self.filters = parse_filters(ex, self.cfg.symbol)
@@ -511,12 +515,26 @@ class Engine:
         self.start_equity = None
         self._prev_pos_qty = 0.0
 
+        # мгновенно обновим снапшот, чтобы UI показал новые настройки
+        with self.lock:
+            snap = self.state.get("snapshot", {})
+            snap.update({
+                "symbol": self.cfg.symbol,
+                "interval": self.cfg.interval,
+                "leverage": self.cfg.leverage,
+                "pos_pct": self.cfg.pos_pct,
+                "use_testnet": self.cfg.use_testnet,
+                "time_offset_ms": self.client.time_offset_ms,
+            })
+            self.state["snapshot"] = snap
+            self.state["filters"] = self.filters
+
         if was_running: self.start()
 
 # ---------- FastAPI ----------
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-engine = Engine(Config())
+_engine = Engine(Config())
 
 # ---------- HTML UI ----------
 INDEX_HTML = """
@@ -613,7 +631,7 @@ setInterval(fetchState,3000); window.addEventListener('load',fetchState);
       <div class="row"><span class="muted">Symbol:</span> <b id="symbol">-</b></div>
       <div class="row"><span class="muted">TF:</span> <b id="interval">-</b></div>
       <div class="row"><span class="muted">Leverage:</span> <b id="leverage">-</b></div>
-      <div class="row"><span class="muted">% Equity:</span> <b id="pos_pct">-</b></div>
+      <div class="row"><span class="muted">% Equity (margin):</span> <b id="pos_pct">-</b></div>
       <div class="row"><span class="muted">Time offset(ms):</span> <b id="offset">-</b></div>
     </div>
 
@@ -662,8 +680,7 @@ setInterval(fetchState,3000); window.addEventListener('load',fetchState);
       </div>
       <div class="row">
         <label>Leverage</label><input id="f_leverage" type="number" min="1" max="125" value="2"/>
-        <!-- По умолчанию показываем 0.90 -->
-        <label>% Equity</label><input id="f_pospct" type="number" step="0.01" min="0.01" max="1.00" value="0.90"/>
+        <label>% Equity (margin)</label><input id="f_pospct" type="number" step="0.01" min="0.01" max="1.00" value="0.97"/>
         <label>SL %</label><input id="f_sl" type="number" step="0.01" min="0" value="0"/>
         <label>TP %</label><input id="f_tp" type="number" step="0.01" min="0" value="0"/>
         <label>Trail %</label><input id="f_trail" type="number" step="0.01" min="0" value="0"/>
@@ -673,7 +690,7 @@ setInterval(fetchState,3000); window.addEventListener('load',fetchState);
         <button class="btn2" type="submit">Apply</button>
         <a class="btn2" href="/trades.csv" download>Download trades.csv</a>
       </div>
-      <div class="muted">Брекеты (SL/TP) ставятся как STOP_MARKET/TAKE_PROFIT_MARKET с closePosition=true (OCO-подобно).</div>
+      <div class="muted">Брекеты (SL/TP) ставятся как STOP_MARKET/TAKE_PROFIT_MARKET с closePosition=true (OCO-подобно). Позиция рассчитывается так, чтобы маржа ≈ % депозита, а номинал = маржа × плечо (из UI).</div>
     </form>
   </div>
 
@@ -687,10 +704,6 @@ setInterval(fetchState,3000); window.addEventListener('load',fetchState);
 """
 
 # ---------- API ----------
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-_engine = Engine(Config())
-
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTMLResponse(INDEX_HTML)
